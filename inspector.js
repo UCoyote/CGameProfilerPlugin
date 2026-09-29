@@ -1,8 +1,13 @@
 (function () {
   function installLayaProfiler() {
-    var profilerVersion = "0.2.4";
+    var profilerVersion = "0.2.5";
     if (window.__LayaProfiler && window.__LayaProfiler.version === profilerVersion) {
       return { ok: true, reused: true };
+    }
+    if (window.__LayaProfiler && typeof window.__LayaProfiler.dispose === "function") {
+      try {
+        window.__LayaProfiler.dispose();
+      } catch (error) {}
     }
 
     var state = {
@@ -18,7 +23,8 @@
       consoleHooked: false,
       webglHooked: false,
       highlightLooping: false,
-      statVisible: false
+      statVisible: false,
+      disposed: false
     };
 
     function findLaya() {
@@ -203,30 +209,31 @@
         }).slice(0, 80);
       }
 
+      if (console.log && console.log.__gameProfilerWrapped) {
+        state.consoleHooked = true;
+        return;
+      }
       ["log", "info", "warn", "error", "debug"].forEach(function (level) {
         var original = console[level];
-        if (typeof original !== "function") return;
-        console[level] = function () {
+        if (typeof original !== "function" || original.__gameProfilerWrapped) return;
+        var wrapped = function () {
           var args = Array.prototype.slice.call(arguments);
           var entry = {
             time: Date.now(),
             level: level,
             message: args.map(function (item) {
               if (typeof item === "string") return item;
-              try {
-                return JSON.stringify(compact(item, 2));
-              } catch (error) {
-                return String(item);
-              }
+              if (item == null || typeof item === "number" || typeof item === "boolean") return String(item);
+              return "[" + typeName(item) + "]";
             }).join(" ")
           };
-          if (level === "warn" || level === "error") {
-            entry.stack = captureConsoleStack();
-          }
+          if (level === "error") entry.stack = captureConsoleStack().slice(0, 12);
           state.logs.push(entry);
-          if (state.logs.length > 300) state.logs.shift();
+          if (state.logs.length > 120) state.logs.shift();
           return original.apply(console, arguments);
         };
+        wrapped.__gameProfilerWrapped = true;
+        console[level] = wrapped;
       });
     }
 
@@ -289,7 +296,48 @@
       wrapContextPrototype(window.WebGL2RenderingContext);
     }
 
+    function unhookWebGLDrawCalls() {
+      function restore(target, name) {
+        if (!target || !target[name] || !target[name].__layaProfilerOriginal) return;
+        try {
+          target[name] = target[name].__layaProfilerOriginal;
+        } catch (error) {}
+      }
+      function restoreContext(Context) {
+        if (!Context || !Context.prototype) return;
+        [
+          "drawArrays",
+          "drawElements",
+          "drawArraysInstanced",
+          "drawElementsInstanced",
+          "drawRangeElements",
+          "multiDrawArraysWEBGL",
+          "multiDrawElementsWEBGL",
+          "getExtension"
+        ].forEach(function (name) {
+          restore(Context.prototype, name);
+        });
+      }
+      restoreContext(window.WebGLRenderingContext);
+      restoreContext(window.WebGL2RenderingContext);
+      state.webglHooked = false;
+    }
+
+    function cocosHasDrawStats(cc) {
+      if (getCocosDevice(cc)) return true;
+      return !!(cc && cc.profiler && cc.profiler.stats);
+    }
+
+    function syncDrawHook(engine) {
+      if (engine && engine.type === "cocos" && cocosHasDrawStats(engine.cc)) {
+        unhookWebGLDrawCalls();
+        return;
+      }
+      if (engine && engine.type === "laya") hookWebGLDrawCalls();
+    }
+
     function sampleFrame(now) {
+      if (state.disposed) return;
       var delta = now - state.lastFrameTime;
       state.lastFrameTime = now;
       state.frameId += 1;
@@ -483,13 +531,40 @@
       };
     }
 
-    function walkNode(node, depth, path, seen, counters, engine) {
+    function readNodeSummary(node, engine) {
+      var cocos = engine && engine.type === "cocos";
+      var name = node.name || "";
+      if (!cocos && node.$owner && node.$owner.name) name = node.$owner.name;
+      if (!name) name = typeName(node);
+      return {
+        name: name,
+        type: cocos ? "Node" : typeName(node),
+        visible: cocos ? node.activeInHierarchy !== false : node.visible !== false,
+        active: node.active !== false && node.destroyed !== true && node.isValid !== false
+      };
+    }
+
+    function countNodes(node, depth, seen) {
+      if (!node || seen.has(node) || depth > 32 || node.__layaProfilerOverlay) return 0;
+      seen.add(node);
+      var total = 1;
+      var children = getChildren(node);
+      for (var index = 0; index < children.length; index += 1) {
+        total += countNodes(children[index], depth + 1, seen);
+      }
+      return total;
+    }
+
+    function walkNode(node, depth, path, seen, counters, engine, detailPath) {
       if (!node || seen.has(node) || depth > 32) return null;
       if (node.__layaProfilerOverlay) return null;
       seen.add(node);
       counters.count += 1;
       var children = getChildren(node);
-      var props = engine && engine.type === "cocos" ? readCocosNode(node, engine.cc, counters) : readLayaNode(node);
+      var detailed = path === detailPath;
+      var props = detailed
+        ? (engine && engine.type === "cocos" ? readCocosNode(node, engine.cc, counters) : readLayaNode(node))
+        : readNodeSummary(node, engine);
       var item = {
         id: node.uuid || node.$_GID || node._id || node.id || path,
         path: path,
@@ -499,10 +574,12 @@
       Object.keys(props).forEach(function (key) {
         item[key] = props[key];
       });
-
-      item.children = children.map(function (child, index) {
-        return walkNode(child, depth + 1, path + "." + index, seen, counters, engine);
-      }).filter(Boolean);
+      var nextChildren = [];
+      for (var index = 0; index < children.length; index += 1) {
+        var child = walkNode(children[index], depth + 1, path + "." + index, seen, counters, engine, detailPath);
+        if (child) nextChildren.push(child);
+      }
+      item.children = nextChildren;
       return item;
     }
 
@@ -2120,6 +2197,7 @@
     }
 
     function updateHighlightOverlay() {
+      if (state.disposed) return;
       state.highlightLooping = false;
       var highlight = window.__LayaProfilerHighlight;
       if (!highlight || !highlight.enabled || !highlight.path) {
@@ -2225,13 +2303,42 @@
       return "未检测到 LayaAir / Cocos Creator";
     }
 
-    function collect() {
+    function collect(options) {
+      options = options || {};
       var engine = detectEngine();
+      syncDrawHook(engine);
+      if (options.detail && options.selectedPath) {
+        var detailNode = findNodeByPath(options.selectedPath);
+        var detail = null;
+        if (detailNode) {
+          detail = engine.type === "cocos" ? readCocosNode(detailNode, engine.cc, { count: 0, sprite: 0 }) : readLayaNode(detailNode);
+          detail.path = options.selectedPath;
+          detail.childCount = getChildren(detailNode).length;
+          detail.id = detailNode.uuid || detailNode.$_GID || detailNode._id || detailNode.id || options.selectedPath;
+        }
+        return {
+          ok: true,
+          time: Date.now(),
+          partial: { detail: true },
+          nodeDetail: detail,
+          detailPath: options.selectedPath
+        };
+      }
+      var wantNodes = !!options.nodes;
+      var wantResources = !!options.resources;
+      var wantConfig = !!options.config;
+      var wantConsole = options.console !== false;
       var counters = { count: 0, sprite: 0 };
-      var root = getEngineRoot(engine);
-      var tree = root ? walkNode(root, 0, "0", new WeakSet(), counters, engine) : null;
-      var resources = collectResources(engine);
+      var root = wantNodes ? getEngineRoot(engine) : null;
+      var detailPath = options.selectedPath || "0";
+      var tree = root ? walkNode(root, 0, "0", new WeakSet(), counters, engine, detailPath) : null;
+      if (!wantNodes) counters.count = countNodes(getEngineRoot(engine), 0, new WeakSet());
+      var resources = wantResources ? collectResources(engine) : [];
       var stats = collectStats(engine, counters.count, counters.sprite, resources);
+      if (!wantResources && engine.type === "cocos") {
+        var deviceGpu = getCocosDeviceGpuBytes(engine.cc);
+        if (deviceGpu > 0) stats.gpuMemory = deviceGpu;
+      }
       return {
         ok: true,
         time: Date.now(),
@@ -2239,13 +2346,17 @@
         engine: engine.type,
         runtimeLabel: runtimeLabelOf(engine),
         timerScale: readTimerScale(engine),
-        nodes: tree,
-        config: collectConfig(),
-        resources: resources,
-        gpu: gpuSummary(resources, stats.gpuDevice),
-        state: collectRuntimeState(engine),
+        partial: {
+          nodes: wantNodes,
+          resources: wantResources,
+          config: wantConfig,
+          console: wantConsole
+        },
+        nodes: wantNodes ? tree : null,
+        config: wantConfig ? collectConfig() : null,
+        resources: wantResources ? resources : null,
+        gpu: wantResources ? gpuSummary(resources, stats.gpuDevice) : null,
         frame: {
-          samples: state.frameSamples.slice(-120),
           stats: {
             frameId: state.frameId,
             fps: stats.fps,
@@ -2257,7 +2368,7 @@
             shaderCall: stats.shaderCall
           }
         },
-        console: state.logs.slice(-200),
+        console: wantConsole ? state.logs.slice(-80) : null,
         monitor: stats
       };
     }
@@ -2572,13 +2683,18 @@
     }
 
     hookConsole();
-    hookWebGLDrawCalls();
     requestAnimationFrame(sampleFrame);
+
+    function disposeProfiler() {
+      state.disposed = true;
+      unhookWebGLDrawCalls();
+    }
 
     window.__LayaProfiler = {
       version: state.version,
       collect: collect,
-      command: command
+      command: command,
+      dispose: disposeProfiler
     };
 
     return { ok: true, reused: false };

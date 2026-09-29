@@ -37,6 +37,11 @@
   var nodeScrubState = null;
   var pendingNodeScrub = null;
   var nodePropertyWrite = 0;
+  var profilerBuild = "0.2.5";
+  var lastNodeSampleAt = 0;
+  var lastResourceSampleAt = 0;
+  var lastConfigSampleAt = 0;
+  var collectOptionsOverride = null;
 
   var mainTabsElement = document.getElementById("mainTabs");
   var mainContentElement = document.getElementById("mainContent");
@@ -100,24 +105,103 @@
   }
 
   async function ensureInspector() {
-    var source = "(" + window.installLayaProfiler.toString() + ")()";
-    return evalInPage(source);
+    var alive = await evalInPage("window.__LayaProfiler && window.__LayaProfiler.version");
+    if (alive.ok && alive.value === profilerBuild) return { ok: true, value: { ok: true, reused: true } };
+    return evalInPage("(" + window.installLayaProfiler.toString() + ")()");
+  }
+
+  function tabVisible(name) {
+    return activeMainTab === name || activeBottomTab === name;
+  }
+
+  function nextCollectOptions() {
+    if (collectOptionsOverride) {
+      var forced = collectOptionsOverride;
+      collectOptionsOverride = null;
+      forced.selectedPath = selectedNodePath || forced.selectedPath || "";
+      return forced;
+    }
+    var now = Date.now();
+    var nodes = tabVisible("nodes") && now - lastNodeSampleAt >= 5000;
+    var resources = (tabVisible("resources") || tabVisible("gpu")) && now - lastResourceSampleAt >= 4000;
+    var config = tabVisible("config") && now - lastConfigSampleAt >= 2000;
+    if (nodes) lastNodeSampleAt = now;
+    if (resources) lastResourceSampleAt = now;
+    if (config) lastConfigSampleAt = now;
+    return {
+      nodes: nodes,
+      resources: resources,
+      config: config,
+      console: tabVisible("console"),
+      selectedPath: selectedNodePath || ""
+    };
+  }
+
+  function requestCollect(options) {
+    collectOptionsOverride = options || {
+      nodes: tabVisible("nodes"),
+      resources: tabVisible("resources") || tabVisible("gpu"),
+      config: tabVisible("config"),
+      console: tabVisible("console"),
+      selectedPath: selectedNodePath || ""
+    };
+    var now = Date.now();
+    if (collectOptionsOverride.nodes) lastNodeSampleAt = now;
+    if (collectOptionsOverride.resources) lastResourceSampleAt = now;
+    if (collectOptionsOverride.config) lastConfigSampleAt = now;
+    collectSnapshot();
+  }
+
+  function mergeSnapshot(next) {
+    if (!snapshot || !next || !next.partial) return next;
+    if (next.partial.detail && next.nodeDetail && next.detailPath && nodeIndex[next.detailPath]) {
+      Object.keys(next.nodeDetail).forEach(function (key) {
+        nodeIndex[next.detailPath][key] = next.nodeDetail[key];
+      });
+      return snapshot;
+    }
+    if (!next.partial.nodes) next.nodes = snapshot.nodes;
+    if (!next.partial.resources) {
+      next.resources = snapshot.resources;
+      next.gpu = snapshot.gpu;
+    }
+    if (!next.partial.config) next.config = snapshot.config;
+    if (!next.partial.console) next.console = snapshot.console;
+    return next;
+  }
+
+  async function loadSelectedNodeDetail(path) {
+    if (!path) return;
+    var installed = await ensureInspector();
+    if (!installed.ok) return;
+    var result = await evalInPage("window.__LayaProfiler && window.__LayaProfiler.collect(" + JSON.stringify({
+      detail: true,
+      selectedPath: path
+    }) + ")");
+    var value = result.value;
+    if (!value || !value.nodeDetail || value.detailPath !== selectedNodePath || !nodeIndex[value.detailPath]) return;
+    Object.keys(value.nodeDetail).forEach(function (key) {
+      nodeIndex[value.detailPath][key] = value.nodeDetail[key];
+    });
+    if (!isEditingNodeInspector()) renderNodes();
   }
 
   async function collectSnapshot() {
     if (paused) return;
     if (nodeScrubState || isEditingNodeInspector()) return;
+    var options = nextCollectOptions();
     var installed = await ensureInspector();
     if (!installed.ok) {
       setStatus("注入失败: " + installed.error, true);
       return;
     }
-    var result = await evalInPage("window.__LayaProfiler && window.__LayaProfiler.collect()");
+    var result = await evalInPage("window.__LayaProfiler && window.__LayaProfiler.collect(" + JSON.stringify(options) + ")");
     if (!result.ok || !result.value) {
       setStatus("采样失败: " + (result.error || "页面未响应"), true);
       return;
     }
-    snapshot = result.value;
+    var partial = result.value.partial || {};
+    snapshot = mergeSnapshot(result.value);
     if (snapshot.monitor) {
       monitorHistory.push({
         time: Date.now(),
@@ -129,7 +213,13 @@
       });
       if (monitorHistory.length > 120) monitorHistory.shift();
     }
-    render({ skipResourcePanel: true });
+    render({
+      skipNodes: !partial.nodes,
+      skipConfig: !partial.config,
+      skipResourcePanel: !partial.resources,
+      skipGpu: !partial.resources,
+      skipConsole: !partial.console
+    });
   }
 
   function setStatus(text, isError) {
@@ -146,6 +236,15 @@
     }
     updatePanelVisibility();
     render();
+    if (name === "nodes" || name === "config" || name === "resources" || name === "gpu") {
+      requestCollect({
+        nodes: name === "nodes",
+        resources: name === "resources" || name === "gpu",
+        config: name === "config",
+        console: false,
+        selectedPath: selectedNodePath || ""
+      });
+    }
   }
 
   function tabLocation(name) {
@@ -184,12 +283,13 @@
   }
 
   function renderPanel(name, options) {
+    options = options || {};
     if (!name) return;
-    if (name === "nodes" && !isEditingNodeInspector()) renderNodes();
-    if (name === "config" && !isInteractingGameConfig()) renderGameConfig();
+    if (name === "nodes" && !options.skipNodes && !isEditingNodeInspector()) renderNodes();
+    if (name === "config" && !options.skipConfig && !isInteractingGameConfig()) renderGameConfig();
     if (name === "resources" && !options.skipResourcePanel) renderResources();
-    if (name === "gpu") renderGpu();
-    if (name === "console") renderConsole();
+    if (name === "gpu" && !options.skipGpu) renderGpu();
+    if (name === "console" && !options.skipConsole) renderConsole();
     if (name === "monitor") renderMonitor();
   }
 
@@ -1795,6 +1895,7 @@
     selectedNodePath = path;
     updateSelectedNodeHighlight();
     renderNodes();
+    loadSelectedNodeDetail(path);
   });
 
   $("searchInput").addEventListener("input", render);
@@ -1810,7 +1911,15 @@
     showingConfigChanges = !showingConfigChanges;
     renderGameConfig();
   });
-  $("refreshBtn").addEventListener("click", collectSnapshot);
+  $("refreshBtn").addEventListener("click", function () {
+    requestCollect({
+      nodes: tabVisible("nodes"),
+      resources: tabVisible("resources") || tabVisible("gpu"),
+      config: tabVisible("config"),
+      console: tabVisible("console"),
+      selectedPath: selectedNodePath || ""
+    });
+  });
   $("pauseBtn").addEventListener("click", function () {
     paused = !paused;
     $("pauseBtn").textContent = paused ? "继续" : "暂停";
@@ -2208,7 +2317,15 @@
     if (event.key === "Enter") $("nodeTimeScaleInput").blur();
   });
 
-  $("refreshNodesBtn").addEventListener("click", collectSnapshot);
+  $("refreshNodesBtn").addEventListener("click", function () {
+    requestCollect({
+      nodes: true,
+      resources: false,
+      config: false,
+      console: false,
+      selectedPath: selectedNodePath || ""
+    });
+  });
 
   $("expandAllNodesBtn").addEventListener("click", function () {
     expandedNodePaths = {};
